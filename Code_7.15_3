@@ -1,0 +1,821 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <AccelStepper.h>
+#include <math.h>
+
+// =========================
+// Pinler
+// =========================
+#define BUTTON_PIN 3
+#define MOTOR_PIN_1 4
+#define MOTOR_PIN_2 6
+#define MOTOR_PIN_3 5
+#define MOTOR_PIN_4 7
+
+// =========================
+// Sabitler
+// =========================
+#define LONGPRESS_MS 1000
+#define DEBOUNCE_MS 40
+#define DAY_MS 86400000UL
+
+const char* AP_SSID = "WatchWinder";
+const char* AP_PASS = "12345678";
+
+const int DEFAULT_STEPS_PER_REV = 4096;
+
+// =========================
+// Web / Storage
+// =========================
+WebServer server(80);
+Preferences prefs;
+
+// =========================
+// Motor
+// IN1-IN3-IN2-IN4
+// =========================
+AccelStepper motor(AccelStepper::HALF4WIRE, MOTOR_PIN_1, MOTOR_PIN_2, MOTOR_PIN_3, MOTOR_PIN_4);
+
+// =========================
+// Enumlar
+// =========================
+enum SystemState {
+  STATE_IDLE,
+  STATE_RUNNING,
+  STATE_WAITING_NEXT_SESSION,
+  STATE_CALIBRATION
+};
+
+enum DirectionMode {
+  DIR_CW = 0,
+  DIR_CCW = 1,
+  DIR_ALT = 2
+};
+
+// =========================
+// Konfig
+// =========================
+struct Config {
+  float maxSpeed;
+  float acceleration;
+  int stepsPerRev;
+  int tpd;
+  int sessionTurns;
+  int directionMode;
+  int calibrationSpeed;
+};
+
+Config config;
+
+// =========================
+// Runtime
+// =========================
+struct RuntimeData {
+  bool enabled;
+  bool calibrationMode;
+  bool currentDirectionCW;
+
+  int turnsToday;
+  int lastSessionTurns;
+
+  unsigned long dayStartMs;
+  unsigned long nextSessionMs;
+  unsigned long sessionIntervalMs;
+
+  long sessionTargetSteps;
+};
+
+RuntimeData rt;
+
+SystemState systemState = STATE_IDLE;
+
+// =========================
+// Buton
+// =========================
+struct ButtonState {
+  bool rawReading;
+  bool stableState;
+  unsigned long lastDebounceTime;
+  unsigned long pressStartTime;
+  bool longPressTriggered;
+};
+
+ButtonState button;
+
+// =========================
+// Yardımcı
+// =========================
+String stateToString(SystemState s) {
+  switch (s) {
+    case STATE_IDLE: return "Beklemede";
+    case STATE_RUNNING: return "Seans Çalışıyor";
+    case STATE_WAITING_NEXT_SESSION: return "Sonraki Seans Bekleniyor";
+    case STATE_CALIBRATION: return "Kalibrasyon";
+    default: return "Bilinmiyor";
+  }
+}
+
+String directionToString(int d) {
+  switch (d) {
+    case DIR_CW: return "CW";
+    case DIR_CCW: return "CCW";
+    case DIR_ALT: return "Alternate";
+    default: return "CW";
+  }
+}
+
+void setDefaults() {
+  config.maxSpeed = 700.0;
+  config.acceleration = 400.0;
+  config.stepsPerRev = DEFAULT_STEPS_PER_REV;
+  config.tpd = 650;
+  config.sessionTurns = 10;
+  config.directionMode = DIR_ALT;
+  config.calibrationSpeed = 250;
+}
+
+void loadConfig() {
+  prefs.begin("winder", true);
+  config.maxSpeed = prefs.getFloat("maxSpeed", 700.0);
+  config.acceleration = prefs.getFloat("accel", 400.0);
+  config.stepsPerRev = prefs.getInt("stepsRev", DEFAULT_STEPS_PER_REV);
+  config.tpd = prefs.getInt("tpd", 650);
+  config.sessionTurns = prefs.getInt("sessTurn", 10);
+  config.directionMode = prefs.getInt("dirMode", DIR_ALT);
+  config.calibrationSpeed = prefs.getInt("calSpd", 250);
+  prefs.end();
+}
+
+void saveConfig() {
+  prefs.begin("winder", false);
+  prefs.putFloat("maxSpeed", config.maxSpeed);
+  prefs.putFloat("accel", config.acceleration);
+  prefs.putInt("stepsRev", config.stepsPerRev);
+  prefs.putInt("tpd", config.tpd);
+  prefs.putInt("sessTurn", config.sessionTurns);
+  prefs.putInt("dirMode", config.directionMode);
+  prefs.putInt("calSpd", config.calibrationSpeed);
+  prefs.end();
+}
+
+void applyMotorConfig() {
+  motor.setMaxSpeed(config.maxSpeed);
+  motor.setAcceleration(config.acceleration);
+}
+
+int getSessionsPerDay() {
+  if (config.sessionTurns <= 0) return 1;
+  return (int)ceil((float)config.tpd / (float)config.sessionTurns);
+}
+
+unsigned long calculateSessionIntervalMs() {
+  int sessions = getSessionsPerDay();
+  if (sessions < 1) sessions = 1;
+  return DAY_MS / sessions;
+}
+
+int getRemainingTurnsToday() {
+  int remain = config.tpd - rt.turnsToday;
+  return remain < 0 ? 0 : remain;
+}
+
+int getNextSessionTurns() {
+  int remain = getRemainingTurnsToday();
+  if (remain <= 0) return 0;
+  if (remain >= config.sessionTurns) return config.sessionTurns;
+  return remain;
+}
+
+bool computeSessionDirectionCW() {
+  if (config.directionMode == DIR_CW) return true;
+  if (config.directionMode == DIR_CCW) return false;
+
+  rt.currentDirectionCW = !rt.currentDirectionCW;
+  return rt.currentDirectionCW;
+}
+
+void stopMotorNow() {
+  motor.stop();
+  motor.disableOutputs();
+}
+
+void resetDay() {
+  rt.turnsToday = 0;
+  rt.lastSessionTurns = 0;
+  rt.dayStartMs = millis();
+  rt.sessionIntervalMs = calculateSessionIntervalMs();
+  rt.nextSessionMs = millis();
+}
+
+void stopSystem() {
+  rt.enabled = false;
+  stopMotorNow();
+  systemState = STATE_IDLE;
+}
+
+void startSessionIfNeeded() {
+  if (!rt.enabled) return;
+  if (systemState == STATE_CALIBRATION) return;
+
+  int sessionTurns = getNextSessionTurns();
+  if (sessionTurns <= 0) {
+    stopSystem();
+    return;
+  }
+
+  bool dirCW = computeSessionDirectionCW();
+
+  applyMotorConfig();
+  motor.enableOutputs();
+  motor.setCurrentPosition(0);
+
+  long steps = (long)sessionTurns * config.stepsPerRev;
+  rt.sessionTargetSteps = dirCW ? steps : -steps;
+  rt.lastSessionTurns = sessionTurns;
+
+  motor.moveTo(rt.sessionTargetSteps);
+  systemState = STATE_RUNNING;
+}
+
+void enterCalibration() {
+  rt.enabled = false;
+  rt.calibrationMode = true;
+  motor.enableOutputs();
+  motor.setMaxSpeed(config.calibrationSpeed);
+  motor.setAcceleration(1000);
+  motor.setSpeed(0);
+  systemState = STATE_CALIBRATION;
+}
+
+void exitCalibration() {
+  rt.calibrationMode = false;
+  motor.setSpeed(0);
+  stopMotorNow();
+  systemState = STATE_IDLE;
+}
+
+void toggleCalibration() {
+  if (systemState == STATE_CALIBRATION) exitCalibration();
+  else enterCalibration();
+}
+
+void toggleStartStop() {
+  if (systemState == STATE_CALIBRATION) return;
+
+  if (rt.enabled) {
+    stopSystem();
+  } else {
+    rt.enabled = true;
+
+    if (millis() - rt.dayStartMs >= DAY_MS) {
+      resetDay();
+    }
+
+    startSessionIfNeeded();
+  }
+}
+
+void resetDailyCounterIfNeeded() {
+  if (millis() - rt.dayStartMs >= DAY_MS) {
+    resetDay();
+    if (rt.enabled && systemState != STATE_CALIBRATION) {
+      startSessionIfNeeded();
+    }
+  }
+}
+
+unsigned long getTimeToNextSessionMs() {
+  if (systemState == STATE_WAITING_NEXT_SESSION && rt.nextSessionMs > millis()) {
+    return rt.nextSessionMs - millis();
+  }
+  return 0;
+}
+
+// =========================
+// Buton
+// =========================
+// Eğer buton GND'ye çekiyorsa INPUT_PULLUP + LOW kullan
+void initButton() {
+  pinMode(BUTTON_PIN, INPUT);
+  button.rawReading = false;
+  button.stableState = false;
+  button.lastDebounceTime = 0;
+  button.pressStartTime = 0;
+  button.longPressTriggered = false;
+}
+
+bool readButtonPressed() {
+  return digitalRead(BUTTON_PIN) == HIGH;
+}
+
+void updateButton() {
+  bool reading = readButtonPressed();
+
+  if (reading != button.rawReading) {
+    button.rawReading = reading;
+    button.lastDebounceTime = millis();
+  }
+
+  if (millis() - button.lastDebounceTime > DEBOUNCE_MS) {
+    if (reading != button.stableState) {
+      button.stableState = reading;
+
+      if (button.stableState) {
+        button.pressStartTime = millis();
+        button.longPressTriggered = false;
+      } else {
+        if (!button.longPressTriggered) {
+          toggleStartStop();
+        }
+      }
+    }
+  }
+
+  if (button.stableState && !button.longPressTriggered) {
+    if (millis() - button.pressStartTime >= LONGPRESS_MS) {
+      button.longPressTriggered = true;
+      toggleCalibration();
+    }
+  }
+}
+
+// =========================
+// Winder mantığı
+// =========================
+void updateWinder() {
+  resetDailyCounterIfNeeded();
+
+  if (systemState == STATE_CALIBRATION) {
+    motor.runSpeed();
+    return;
+  }
+
+  if (!rt.enabled) return;
+
+  switch (systemState) {
+    case STATE_RUNNING:
+      motor.run();
+
+      if (motor.distanceToGo() == 0) {
+        rt.turnsToday += rt.lastSessionTurns;
+
+        if (rt.turnsToday >= config.tpd) {
+          stopSystem();
+        } else {
+          motor.disableOutputs();
+          rt.nextSessionMs = millis() + rt.sessionIntervalMs;
+          systemState = STATE_WAITING_NEXT_SESSION;
+        }
+      }
+      break;
+
+    case STATE_WAITING_NEXT_SESSION:
+      if (millis() >= rt.nextSessionMs) {
+        startSessionIfNeeded();
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// =========================
+// HTML
+// =========================
+String htmlPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Watch Winder</title>
+  <style>
+    :root{
+      --bg:#0b1220;
+      --card:#111827;
+      --line:#1f2937;
+      --muted:#94a3b8;
+      --text:#e5e7eb;
+      --green:#22c55e;
+      --blue:#3b82f6;
+      --red:#ef4444;
+      --gray:#64748b;
+      --input:#0f172a;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:Inter,system-ui,Arial,sans-serif;
+      background:linear-gradient(180deg,#0b1220,#111827);
+      color:var(--text);
+      padding:24px;
+    }
+    .wrap{max-width:1080px;margin:0 auto}
+    .title{font-size:30px;font-weight:800;margin-bottom:6px}
+    .sub{color:var(--muted);margin-bottom:22px}
+    .grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+      gap:16px;
+    }
+    .card{
+      background:rgba(17,24,39,.96);
+      border:1px solid var(--line);
+      border-radius:20px;
+      padding:18px;
+      box-shadow:0 10px 30px rgba(0,0,0,.25);
+    }
+    h3{margin:0 0 14px 0;font-size:18px}
+    .row{
+      display:flex;
+      justify-content:space-between;
+      gap:16px;
+      padding:9px 0;
+      border-bottom:1px solid rgba(255,255,255,.06);
+    }
+    .row:last-child{border-bottom:none}
+    .label{color:var(--muted)}
+    .value{font-weight:700;text-align:right}
+    form{display:flex;flex-direction:column;gap:12px}
+    label{
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      color:var(--muted);
+      font-size:14px;
+    }
+    input,select{
+      width:100%;
+      border:1px solid #223047;
+      background:var(--input);
+      color:var(--text);
+      border-radius:12px;
+      padding:12px 14px;
+      outline:none;
+      font-size:15px;
+    }
+    .actions{
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      margin-top:10px;
+    }
+    button,.btn{
+      border:none;
+      color:white;
+      text-decoration:none;
+      border-radius:12px;
+      padding:12px 16px;
+      min-width:120px;
+      text-align:center;
+      font-weight:700;
+      cursor:pointer;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .green{background:var(--green)}
+    .blue{background:var(--blue)}
+    .red{background:var(--red)}
+    .gray{background:var(--gray)}
+    .hint{margin-top:10px;color:var(--muted);font-size:13px}
+    .tiny{font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="title">Watch Winder</div>
+  <div class="sub">Gerçek TPD mantığıyla çalışan kontrol paneli</div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Durum</h3>
+      <div class="row"><div class="label">Durum</div><div class="value" id="state">%STATE%</div></div>
+      <div class="row"><div class="label">Aktif</div><div class="value" id="enabled">%ENABLED%</div></div>
+      <div class="row"><div class="label">Kalibrasyon</div><div class="value" id="calib">%CALIB%</div></div>
+      <div class="row"><div class="label">Bugünkü Tur</div><div class="value" id="today">%TODAY%</div></div>
+      <div class="row"><div class="label">TPD</div><div class="value" id="tpd">%TPD%</div></div>
+      <div class="row"><div class="label">Kalan Tur</div><div class="value" id="remain">%REMAIN%</div></div>
+      <div class="row"><div class="label">Yön Modu</div><div class="value" id="dir">%DIR%</div></div>
+      <div class="row"><div class="label">Seans Aralığı</div><div class="value" id="interval">%INTERVAL%</div></div>
+      <div class="row"><div class="label">Sonraki Seans</div><div class="value" id="next">%NEXT%</div></div>
+      <div class="row"><div class="label">IP</div><div class="value">%IP%</div></div>
+
+      <div class="actions">
+        <a class="btn green" href="/start">Başlat</a>
+        <a class="btn red" href="/stop">Durdur</a>
+        <a class="btn blue" href="/calibration">Kalibrasyon</a>
+      </div>
+      <div class="hint">Buton: kısa bas = başlat/durdur, uzun bas = kalibrasyon</div>
+    </div>
+
+    <div class="card">
+      <h3>Ayarlar</h3>
+      <form action="/save" method="post">
+        <label>TPD (Turns Per Day)
+          <input type="number" name="tpd" value="%TPD%">
+        </label>
+
+        <label>Seans Başına Tur
+          <input type="number" name="sessionTurns" value="%SESSION%">
+        </label>
+
+        <label>Yön Modu
+          <select name="directionMode">
+            <option value="0" %DIR0%>CW</option>
+            <option value="1" %DIR1%>CCW</option>
+            <option value="2" %DIR2%>Alternate</option>
+          </select>
+        </label>
+
+        <label>Maksimum Hız
+          <input type="number" name="maxSpeed" value="%MAXSPEED%">
+        </label>
+
+        <label>İvmelenme
+          <input type="number" name="acceleration" value="%ACCEL%">
+        </label>
+
+        <label>Tur Başına Step
+          <input type="number" name="stepsPerRev" value="%STEPSREV%">
+        </label>
+
+        <label>Kalibrasyon Hızı
+          <input type="number" name="calibrationSpeed" value="%CALSPD%">
+        </label>
+
+        <div class="actions">
+          <button class="blue" type="submit">Kaydet</button>
+        </div>
+      </form>
+      <div class="hint">Seans aralığı otomatik hesaplanır: 24 saat / günlük seans sayısı</div>
+    </div>
+
+    <div class="card">
+      <h3>Kalibrasyon ve Test</h3>
+      <div class="actions">
+        <a class="btn gray" href="/calib/forward">İleri</a>
+        <a class="btn gray" href="/calib/backward">Geri</a>
+        <a class="btn red" href="/calib/stop">Dur</a>
+      </div>
+
+      <div class="actions">
+        <a class="btn gray" href="/test?turns=1">1 Tur Test</a>
+        <a class="btn gray" href="/test?turns=5">5 Tur Test</a>
+        <a class="btn gray" href="/test?turns=10">10 Tur Test</a>
+      </div>
+
+      <div class="actions">
+        <a class="btn gray" href="/resetToday">Bugünü Sıfırla</a>
+      </div>
+
+      <div class="hint">İleri/Geri sadece kalibrasyon modundayken çalışır.</div>
+      <div class="tiny">Durum verisi 2 saniyede bir yenilenir.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+function formatMs(ms){
+  if(ms <= 0) return "Hazır";
+  let sec = Math.floor(ms / 1000);
+  let h = Math.floor(sec / 3600);
+  let m = Math.floor((sec % 3600) / 60);
+  let s = sec % 60;
+  if(h > 0) return h + "s " + m + "dk";
+  if(m > 0) return m + "dk " + s + "sn";
+  return s + "sn";
+}
+
+async function refreshStatus(){
+  try{
+    const res = await fetch('/status');
+    const s = await res.json();
+    document.getElementById('state').textContent = s.state;
+    document.getElementById('enabled').textContent = s.enabled ? 'Evet' : 'Hayır';
+    document.getElementById('calib').textContent = s.calibration ? 'Açık' : 'Kapalı';
+    document.getElementById('today').textContent = s.turnsToday;
+    document.getElementById('tpd').textContent = s.tpd;
+    document.getElementById('remain').textContent = s.remainingTurns;
+    document.getElementById('dir').textContent = s.direction;
+    document.getElementById('interval').textContent = formatMs(s.sessionIntervalMs);
+    document.getElementById('next').textContent = formatMs(s.nextSessionInMs);
+  }catch(e){}
+}
+setInterval(refreshStatus, 2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+  html.replace("%STATE%", stateToString(systemState));
+  html.replace("%ENABLED%", rt.enabled ? "Evet" : "Hayır");
+  html.replace("%CALIB%", rt.calibrationMode ? "Açık" : "Kapalı");
+  html.replace("%TODAY%", String(rt.turnsToday));
+  html.replace("%TPD%", String(config.tpd));
+  html.replace("%REMAIN%", String(getRemainingTurnsToday()));
+  html.replace("%DIR%", directionToString(config.directionMode));
+  html.replace("%INTERVAL%", String(calculateSessionIntervalMs() / 1000));
+  html.replace("%NEXT%", String(getTimeToNextSessionMs() / 1000));
+  html.replace("%IP%", WiFi.softAPIP().toString());
+
+  html.replace("%SESSION%", String(config.sessionTurns));
+  html.replace("%MAXSPEED%", String(config.maxSpeed, 0));
+  html.replace("%ACCEL%", String(config.acceleration, 0));
+  html.replace("%STEPSREV%", String(config.stepsPerRev));
+  html.replace("%CALSPD%", String(config.calibrationSpeed));
+
+  html.replace("%DIR0%", config.directionMode == 0 ? "selected" : "");
+  html.replace("%DIR1%", config.directionMode == 1 ? "selected" : "");
+  html.replace("%DIR2%", config.directionMode == 2 ? "selected" : "");
+
+  return html;
+}
+
+// =========================
+// JSON status
+// =========================
+String jsonStatus() {
+  String json = "{";
+  json += "\"state\":\"" + stateToString(systemState) + "\",";
+  json += "\"enabled\":" + String(rt.enabled ? "true" : "false") + ",";
+  json += "\"calibration\":" + String(rt.calibrationMode ? "true" : "false") + ",";
+  json += "\"turnsToday\":" + String(rt.turnsToday) + ",";
+  json += "\"tpd\":" + String(config.tpd) + ",";
+  json += "\"remainingTurns\":" + String(getRemainingTurnsToday()) + ",";
+  json += "\"direction\":\"" + directionToString(config.directionMode) + "\",";
+  json += "\"sessionIntervalMs\":" + String(rt.sessionIntervalMs) + ",";
+  json += "\"nextSessionInMs\":" + String(getTimeToNextSessionMs());
+  json += "}";
+  return json;
+}
+
+// =========================
+// Web
+// =========================
+void redirectHome() {
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "OK");
+}
+
+void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", htmlPage());
+}
+
+void handleStatus() {
+  server.send(200, "application/json", jsonStatus());
+}
+
+void handleStart() {
+  if (systemState != STATE_CALIBRATION) {
+    rt.enabled = true;
+    if (systemState == STATE_IDLE || systemState == STATE_WAITING_NEXT_SESSION) {
+      startSessionIfNeeded();
+    }
+  }
+  redirectHome();
+}
+
+void handleStop() {
+  stopSystem();
+  redirectHome();
+}
+
+void handleCalibration() {
+  toggleCalibration();
+  redirectHome();
+}
+
+void handleSave() {
+  if (server.hasArg("tpd")) config.tpd = server.arg("tpd").toInt();
+  if (server.hasArg("sessionTurns")) config.sessionTurns = server.arg("sessionTurns").toInt();
+  if (server.hasArg("directionMode")) config.directionMode = server.arg("directionMode").toInt();
+  if (server.hasArg("maxSpeed")) config.maxSpeed = server.arg("maxSpeed").toFloat();
+  if (server.hasArg("acceleration")) config.acceleration = server.arg("acceleration").toFloat();
+  if (server.hasArg("stepsPerRev")) config.stepsPerRev = server.arg("stepsPerRev").toInt();
+  if (server.hasArg("calibrationSpeed")) config.calibrationSpeed = server.arg("calibrationSpeed").toInt();
+
+  if (config.tpd < 1) config.tpd = 1;
+  if (config.sessionTurns < 1) config.sessionTurns = 1;
+  if (config.directionMode < 0 || config.directionMode > 2) config.directionMode = DIR_ALT;
+  if (config.maxSpeed < 50) config.maxSpeed = 50;
+  if (config.acceleration < 10) config.acceleration = 10;
+  if (config.stepsPerRev < 100) config.stepsPerRev = DEFAULT_STEPS_PER_REV;
+  if (config.calibrationSpeed < 50) config.calibrationSpeed = 50;
+
+  rt.sessionIntervalMs = calculateSessionIntervalMs();
+  saveConfig();
+  applyMotorConfig();
+
+  redirectHome();
+}
+
+void handleCalibForward() {
+  if (systemState == STATE_CALIBRATION) {
+    motor.enableOutputs();
+    motor.setMaxSpeed(config.calibrationSpeed);
+    motor.setSpeed(config.calibrationSpeed);
+  }
+  redirectHome();
+}
+
+void handleCalibBackward() {
+  if (systemState == STATE_CALIBRATION) {
+    motor.enableOutputs();
+    motor.setMaxSpeed(config.calibrationSpeed);
+    motor.setSpeed(-config.calibrationSpeed);
+  }
+  redirectHome();
+}
+
+void handleCalibStop() {
+  if (systemState == STATE_CALIBRATION) {
+    motor.setSpeed(0);
+    motor.disableOutputs();
+  }
+  redirectHome();
+}
+
+void runBlockingTestTurns(int turns) {
+  if (turns < 1) turns = 1;
+
+  applyMotorConfig();
+  motor.enableOutputs();
+  motor.setCurrentPosition(0);
+  motor.moveTo((long)turns * config.stepsPerRev);
+
+  unsigned long t0 = millis();
+  while (motor.distanceToGo() != 0 && (millis() - t0 < 60000UL)) {
+    motor.run();
+    delay(1);
+  }
+  motor.disableOutputs();
+}
+
+void handleTest() {
+  if (systemState == STATE_IDLE && server.hasArg("turns")) {
+    int turns = server.arg("turns").toInt();
+    runBlockingTestTurns(turns);
+  }
+  redirectHome();
+}
+
+void handleResetToday() {
+  resetDay();
+  redirectHome();
+}
+
+void setupWeb() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.on("/calibration", handleCalibration);
+  server.on("/save", HTTP_POST, handleSave);
+
+  server.on("/calib/forward", handleCalibForward);
+  server.on("/calib/backward", handleCalibBackward);
+  server.on("/calib/stop", handleCalibStop);
+
+  server.on("/test", handleTest);
+  server.on("/resetToday", handleResetToday);
+
+  server.begin();
+}
+
+// =========================
+// Setup / Loop
+// =========================
+void setup() {
+  setDefaults();
+  loadConfig();
+
+  rt.enabled = false;
+  rt.calibrationMode = false;
+  rt.currentDirectionCW = false;
+  rt.turnsToday = 0;
+  rt.lastSessionTurns = 0;
+  rt.dayStartMs = millis();
+  rt.sessionIntervalMs = calculateSessionIntervalMs();
+  rt.nextSessionMs = millis();
+  rt.sessionTargetSteps = 0;
+
+  applyMotorConfig();
+  motor.disableOutputs();
+
+  initButton();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  setupWeb();
+}
+
+void loop() {
+  updateButton();
+  updateWinder();
+  server.handleClient();
+}
